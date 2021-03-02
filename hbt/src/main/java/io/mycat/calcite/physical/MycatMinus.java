@@ -74,9 +74,9 @@ public class MycatMinus extends Minus implements MycatRel {
             EnumerableRel input = (EnumerableRel) ord.e;
             final Result result = implementor.visitChild(this, ord.i, input, pref);
             Expression childExp =
-                    builder.append(
+                    toEnumerate(builder.append(
                             "child" + ord.i,
-                            result.block);
+                            result.block));
 
             if (minusExp == null) {
                 minusExp = childExp;
@@ -99,7 +99,11 @@ public class MycatMinus extends Minus implements MycatRel {
                 PhysTypeImpl.of(
                         implementor.getTypeFactory(),
                         getRowType(),
-                        pref.prefer(JavaRowFormat.CUSTOM));
+                        pref.prefer(JavaRowFormat.ARRAY));
         return implementor.result(physType, builder.toBlock());
+    }
+    @Override
+    public boolean isSupportStream() {
+        return false;
     }
 }

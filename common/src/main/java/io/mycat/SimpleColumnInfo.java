@@ -50,10 +50,30 @@ public class SimpleColumnInfo {
     final int id;
 
 
-    public SimpleColumnInfo(@NonNull String columnName, int precision, int scale, @NonNull JDBCType jdbcType, boolean nullable, boolean autoIncrement, boolean primaryKey, boolean index,int id) {
+    public SimpleColumnInfo(@NonNull String columnName, int precision, int scale, @NonNull JDBCType jdbcType, boolean nullable, boolean autoIncrement, boolean primaryKey, boolean index, int id) {
         this.columnName = columnName;
         this.precision = precision;
         this.scale = scale;
+
+        switch (jdbcType) {
+            case BIT:
+            case TINYINT:
+            case SMALLINT:
+            case INTEGER:
+            case BIGINT:
+                jdbcType = JDBCType.BIGINT;
+                break;
+            case NUMERIC:
+                jdbcType = JDBCType.DECIMAL;
+                break;
+            case FLOAT:
+            case REAL:
+            case DOUBLE:
+                jdbcType = JDBCType.DOUBLE;
+                break;
+            default:
+                break;
+        }
         this.jdbcType = jdbcType;
         this.nullable = nullable;
         this.autoIncrement = autoIncrement;
@@ -64,12 +84,13 @@ public class SimpleColumnInfo {
 
     /**
      * 是否是索引列
+     *
      * @return true =是索引列
      */
-    public boolean isIndexKey(){
+    public boolean isIndexKey() {
         for (IndexInfo indexInfo : indexKeyList) {
             for (SimpleColumnInfo indexInfoIndex : indexInfo.getIndexes()) {
-                if(indexInfoIndex == this){
+                if (indexInfoIndex == this) {
                     return true;
                 }
             }
@@ -79,9 +100,10 @@ public class SimpleColumnInfo {
 
     /**
      * 是否是覆盖列
+     *
      * @return true =是覆盖列
      */
-    public boolean isIndexCovering(){
+    public boolean isIndexCovering() {
         for (IndexInfo indexInfo : indexCoveringList) {
             for (SimpleColumnInfo indexInfoIndex : indexInfo.getCovering()) {
                 if (indexInfoIndex == this) {
@@ -94,17 +116,19 @@ public class SimpleColumnInfo {
 
     /**
      * 是否是主键
+     *
      * @return
      */
-    public boolean isPrimaryKey(){
+    public boolean isPrimaryKey() {
         return primaryKey;
     }
 
     /**
      * 是否是分片键
+     *
      * @return
      */
-    public boolean isShardingKey(){
+    public boolean isShardingKey() {
         return shardingKey;
     }
 
@@ -162,7 +186,7 @@ public class SimpleColumnInfo {
     }
 
     public Object normalizeValue(Object o) {
-        if (o == null){
+        if (o == null) {
             return o;
         }
         switch (getType()) {
@@ -206,7 +230,8 @@ public class SimpleColumnInfo {
                 throw new IllegalArgumentException();
             case TIMESTAMP:
                 if (o instanceof String) {
-                    return MycatTimeUtil.timestampStringToTimestamp((String) o);
+                    Temporal toTimestamp = MycatTimeUtil.timestampStringToTimestamp((String) o);
+                    return toTimestamp;
                 }
                 if (o instanceof LocalDateTime) {
                     return o;

@@ -23,12 +23,14 @@ import io.mycat.config.MySQLServerCapabilityFlags;
 import java.io.UnsupportedEncodingException;
 import java.nio.charset.Charset;
 import java.sql.ResultSetMetaData;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 
 /**
  * @author jamie12221 date 2019-05-07 21:23
- *
+ * <p>
  * 写入的报文构造工具 注意的是,函数名没有带有packet后缀的,生成的是payload(没有报文头部和拆分报文处理) 带有packet后缀的,会进行报文处理(根据packetid,payload长度进行生成报文)
  **/
 public class MySQLPacketUtil {
@@ -117,6 +119,18 @@ public class MySQLPacketUtil {
         }
     }
 
+    public static final Iterable<byte[]> generateAllColumnDefPayload(MycatRowMetaData metaData) {
+        List<byte[]> list = new ArrayList<>(metaData.getColumnCount());
+        final int count = metaData.getColumnCount();
+        for (int index = 0; index < count; index++) {
+            list.add(MySQLPacketUtil
+                    .generateColumnDefPayload(
+                            metaData,
+                            index));
+        }
+        return list;
+    }
+
     public static final byte[] generateColumnDefPayload(MycatRowMetaData metaData, int columnIndex) {
         try (MySQLPayloadWriter writer = new MySQLPayloadWriter(128)) {
             ColumnDefPacketImpl columnDefPacket = new ColumnDefPacketImpl(metaData, columnIndex);
@@ -145,20 +159,12 @@ public class MySQLPacketUtil {
             writer.writeByte((byte) header);
             writer.writeLenencInt(affectedRows);
             writer.writeLenencInt(lastInsertId);
-            if (isClientProtocol41) {
-                writer.writeFixInt(2, serverStatus);
-                writer.writeFixInt(2, warningCount);
-            } else if (isKnowsAboutTransactions) {
-                writer.writeFixInt(2, serverStatus);
+            writer.writeFixInt(2, serverStatus);
+            writer.writeFixInt(2, warningCount);
+            if (message == null) {
+                message = "";
             }
-//      if (sessionVariableTracking) {
-//        throw new MycatException("unsupport!!");
-//      } else {
-//
-//      }
-            if (message != null) {
-                writer.writeBytes(message.getBytes());
-            }
+            writer.writeEOFString(message);
             return writer.toByteArray();
         }
     }
@@ -170,8 +176,8 @@ public class MySQLPacketUtil {
      */
 
     /**
-     * @param errno the error code
-     * @param message the error massage
+     * @param errno                 the error code
+     * @param message               the error massage
      * @param serverCapabilityFlags server capability
      * @return the data of payload
      */
@@ -181,7 +187,7 @@ public class MySQLPacketUtil {
     ) {
         try (MySQLPayloadWriter writer = new MySQLPayloadWriter(64)) {
             ErrorPacketImpl errorPacket = new ErrorPacketImpl();
-            if (message!=null) {
+            if (message != null) {
                 errorPacket.setErrorMessage(message.getBytes());
             }
             errorPacket.setErrorCode(errno);
@@ -368,7 +374,7 @@ public class MySQLPacketUtil {
 
     /**
      * @param fieldValues 字段值 数组为null就是字段值为null
-     * @param writer 结果
+     * @param writer      结果
      */
     public static void writeTextRow(byte[][] fieldValues, MySQLPayloadWriteView writer) {
         int fieldCount = fieldValues.length;

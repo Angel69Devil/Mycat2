@@ -15,24 +15,59 @@
 package io.mycat.calcite.physical;
 
 
+import com.google.common.collect.Iterators;
 import io.mycat.calcite.*;
+import io.mycat.calcite.logical.MycatView;
+import io.reactivex.rxjava3.core.Observable;
+import org.apache.calcite.DataContext;
+import org.apache.calcite.adapter.enumerable.JavaRowFormat;
+import org.apache.calcite.adapter.enumerable.PhysType;
+import org.apache.calcite.adapter.enumerable.PhysTypeImpl;
+import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.EnumerableDefaults;
+import org.apache.calcite.linq4j.Linq4j;
+import org.apache.calcite.linq4j.function.Function1;
+import org.apache.calcite.linq4j.tree.BlockBuilder;
+import org.apache.calcite.linq4j.tree.Expression;
+import org.apache.calcite.linq4j.tree.Expressions;
+import org.apache.calcite.linq4j.tree.Types;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rex.RexDynamicParam;
+import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.runtime.NewMycatDataContext;
+import org.apache.calcite.util.BuiltInMethod;
+import org.apache.calcite.util.Pair;
+import org.apache.calcite.util.RxBuiltInMethodImpl;
+import org.jetbrains.annotations.NotNull;
+
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
 
 public class MycatMergeSort extends Sort implements MycatRel {
 
+    private static final Method ORDER_BY_METHOD = Types.lookupMethod(MycatMergeSort.class,
+            "orderBy", List.class,
+            Function1.class, Comparator.class, int.class, int.class);
+    private static final Method STREAM_ORDER_BY = Types.lookupMethod(MycatMergeSort.class,
+            "streamOrderBy", List.class,
+            Function1.class, Comparator.class, int.class, int.class);
     protected MycatMergeSort(RelOptCluster cluster,
-                          RelTraitSet traits,
-                          RelNode child,
-                          RelCollation collation,
-                          RexNode offset,
-                          RexNode fetch) {
+                             RelTraitSet traits,
+                             RelNode child,
+                             RelCollation collation,
+                             RexNode offset,
+                             RexNode fetch) {
         super(cluster, traits, child, collation, offset, fetch);
     }
+
     public static MycatMergeSort create(RelTraitSet traits, RelNode child, RelCollation collation, RexNode offset, RexNode fetch) {
         return new MycatMergeSort(
                 child.getCluster(),
@@ -41,8 +76,9 @@ public class MycatMergeSort extends Sort implements MycatRel {
                 collation,
                 offset,
                 fetch
-                );
+        );
     }
+
     @Override
     public ExplainWriter explain(ExplainWriter writer) {
         writer.name("MycatMergeSort").into();
@@ -63,9 +99,153 @@ public class MycatMergeSort extends Sort implements MycatRel {
         return new MycatMergeSort(getCluster(), traitSet, newInput, newCollation, offset, fetch);
     }
 
+    final static Method GET_ENUMERABLES =
+            Types.lookupMethod(NewMycatDataContext.class,
+                    "getEnumerables", org.apache.calcite.rel.RelNode.class);
+    final static Method GET_OBSERVABLES =
+            Types.lookupMethod(NewMycatDataContext.class,
+                    "getObservables", org.apache.calcite.rel.RelNode.class);
+
     @Override
     public Result implement(MycatEnumerableRelImplementor implementor, Prefer pref) {
-        MycatMemSort mycatMemSort = MycatMemSort.create(getTraitSet(), getInput(), getCollation(), offset, fetch);
-        return mycatMemSort.implement(implementor,pref);
+        Expression inputExpression = implementor.stash((MycatView) this.getInput(), MycatView.class);
+        final BlockBuilder builder = new BlockBuilder();
+        Expression listExpression = builder.append("list", Expressions.call(
+                DataContext.ROOT, GET_ENUMERABLES, inputExpression));
+        final PhysType physType =
+                PhysTypeImpl.of(
+                        implementor.getTypeFactory(),
+                        getRowType(),
+                        JavaRowFormat.ARRAY);
+
+        final PhysType inputPhysType = physType;
+        final Pair<Expression, Expression> pair =
+                inputPhysType.generateCollationKey(this.collation.getFieldCollations());
+
+        final Expression fetchVal;
+        if (this.fetch == null) {
+            fetchVal = Expressions.constant(Integer.valueOf(Integer.MAX_VALUE));
+        } else {
+            fetchVal = getExpression(this.fetch);
+        }
+
+        final Expression offsetVal = this.offset == null ? Expressions.constant(Integer.valueOf(0))
+                : getExpression(this.offset);
+
+        builder.add(
+                Expressions.return_(
+                        null, Expressions.call(
+                                ORDER_BY_METHOD, Expressions.list(
+                                        listExpression,
+                                        builder.append("keySelector", pair.left))
+                                        .appendIfNotNull(builder.appendIfNotNull("comparator", pair.right))
+                                        .appendIfNotNull(
+                                                builder.appendIfNotNull("offset",
+                                                        Expressions.constant(offsetVal)))
+                                        .appendIfNotNull(
+                                                builder.appendIfNotNull("fetch",
+                                                        Expressions.constant(fetchVal)))
+                        )));
+        return implementor.result(physType, builder.toBlock());
+    }
+
+    public static Expression getExpression(RexNode rexNode) {
+        if (rexNode instanceof RexDynamicParam) {
+            final RexDynamicParam param = (RexDynamicParam) rexNode;
+            return Expressions.convert_(
+                    Expressions.call(DataContext.ROOT,
+                            BuiltInMethod.DATA_CONTEXT_GET.method,
+                            Expressions.constant("?" + param.getIndex())),
+                    Integer.class);
+        } else {
+            return Expressions.constant(RexLiteral.intValue(rexNode));
+        }
+    }
+
+    public static <TSource, TKey> Observable<TSource> streamOrderBy(
+            List<Observable<TSource>> sources,
+            Function1<TSource, TKey> keySelector,
+            Comparator<TKey> comparator,
+            int offset, int fetch) {
+
+        return RxBuiltInMethodImpl.mergeSort(sources, (o1, o2) -> {
+            TKey left = keySelector.apply(o1);
+            TKey right = keySelector.apply(o2);
+            return comparator.compare(left, right);
+        }, offset, fetch);
+    }
+
+    public static <TSource, TKey> Enumerable<TSource> orderBy(
+            List<Enumerable<TSource>> sources,
+            Function1<TSource, TKey> keySelector,
+            Comparator<TKey> comparator,
+            int offset, int fetch) {
+        Enumerable<TSource> tSources = Linq4j.asEnumerable(new Iterable<TSource>() {
+            @NotNull
+            @Override
+            public Iterator<TSource> iterator() {
+                List<Iterator<TSource>> list = new ArrayList<>();
+                for (Enumerable<TSource> source : sources) {
+                    list.add(source.iterator());
+                }
+
+                return Iterators.<TSource>mergeSorted(list, (o1, o2) -> {
+                    TKey left = keySelector.apply(o1);
+                    TKey right = keySelector.apply(o2);
+                    return comparator.compare(left, right);
+                });
+            }
+        });
+        tSources = EnumerableDefaults.skip(tSources, offset);
+        tSources = EnumerableDefaults.take(tSources, fetch);
+        return tSources;
+    }
+
+    @Override
+    public Result implementStream(StreamMycatEnumerableRelImplementor implementor, Prefer pref) {
+        Expression inputExpression = implementor.stash((MycatView) this.getInput(), MycatView.class);
+        final BlockBuilder builder = new BlockBuilder();
+        Expression listExpression = builder.append("list", Expressions.call(
+                DataContext.ROOT, GET_OBSERVABLES, inputExpression));
+        final PhysType physType =
+                PhysTypeImpl.of(
+                        implementor.getTypeFactory(),
+                        getRowType(),
+                        JavaRowFormat.ARRAY);
+
+        final PhysType inputPhysType = physType;
+        final Pair<Expression, Expression> pair =
+                inputPhysType.generateCollationKey(this.collation.getFieldCollations());
+
+        final Expression fetchVal;
+        if (this.fetch == null) {
+            fetchVal = Expressions.constant(Integer.valueOf(Integer.MAX_VALUE));
+        } else {
+            fetchVal = getExpression(this.fetch);
+        }
+
+        final Expression offsetVal = this.offset == null ? Expressions.constant(Integer.valueOf(0))
+                : getExpression(this.offset);
+
+        builder.add(
+                Expressions.return_(
+                        null, Expressions.call(
+                                STREAM_ORDER_BY, Expressions.list(
+                                        listExpression,
+                                        builder.append("keySelector", pair.left))
+                                        .appendIfNotNull(builder.appendIfNotNull("comparator", pair.right))
+                                        .appendIfNotNull(
+                                                builder.appendIfNotNull("offset",
+                                                        Expressions.constant(offsetVal)))
+                                        .appendIfNotNull(
+                                                builder.appendIfNotNull("fetch",
+                                                        Expressions.constant(fetchVal)))
+                        )));
+        return implementor.result(physType, builder.toBlock());
+    }
+
+    @Override
+    public boolean isSupportStream() {
+        return true;
     }
 }

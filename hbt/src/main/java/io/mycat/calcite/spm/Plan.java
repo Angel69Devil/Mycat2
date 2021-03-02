@@ -14,20 +14,36 @@
  */
 package io.mycat.calcite.spm;
 
-import io.mycat.beans.mycat.MycatRowMetaData;
+import io.mycat.DrdsSql;
+import io.mycat.MycatDataContext;
+import io.mycat.calcite.CodeExecuterContext;
+import io.mycat.calcite.resultset.CalciteRowMetaData;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.rel.RelNode;
 
+import java.util.List;
+
 public interface Plan extends Comparable<Plan> {
+
+    boolean forUpdate();
 
     RelOptCost getRelOptCost();
 
-    public MycatRowMetaData rowMetaData();
-
     public Type getType();
-    public RelNode getRelNode();
-    static public enum Type{
-        PARSE,
-        FINAL
+
+    public CodeExecuterContext getCodeExecuterContext();
+
+    public RelNode getPhysical();
+
+    List<String> explain(MycatDataContext dataContext, DrdsSql drdsSql);
+
+    static public enum Type {
+        PHYSICAL,
+        UPDATE,
+        INSERT
+    }
+
+    public default CalciteRowMetaData getMetaData() {
+        return new CalciteRowMetaData(getPhysical().getRowType().getFieldList());
     }
 }

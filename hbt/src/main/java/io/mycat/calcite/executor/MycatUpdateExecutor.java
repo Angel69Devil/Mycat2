@@ -1,15 +1,14 @@
 package io.mycat.calcite.executor;
 
-import com.alibaba.druid.sql.SQLUtils;
 import com.alibaba.druid.sql.ast.SQLStatement;
 import com.alibaba.druid.sql.ast.statement.SQLDeleteStatement;
 import com.alibaba.druid.sql.ast.statement.SQLExprTableSource;
 import com.alibaba.druid.sql.ast.statement.SQLUpdateStatement;
 import io.mycat.*;
 import io.mycat.beans.mycat.MycatErrorCode;
-import io.mycat.calcite.DataSourceFactory;
 import io.mycat.calcite.Executor;
 import io.mycat.calcite.ExplainWriter;
+import io.mycat.calcite.physical.MycatUpdateRel;
 import io.mycat.calcite.rewriter.Distribution;
 import io.mycat.gsi.GSIService;
 import io.mycat.mpp.Row;
@@ -34,6 +33,7 @@ import static io.mycat.calcite.executor.MycatPreparedStatementUtil.apply;
 public class MycatUpdateExecutor implements Executor {
 
     private final MycatDataContext context;
+    private final MycatUpdateRel mycatUpdateRel;
     private final Distribution distribution;
     /**
      * 逻辑语法树（用户在前端写的SQL语句）
@@ -47,32 +47,43 @@ public class MycatUpdateExecutor implements Executor {
      * 由逻辑SQL 改成真正发送给后端数据库的sql语句. 一个不可变的集合 {@link Collections#unmodifiableSet(Set)}
      */
     private final Set<SQL> reallySqlSet;
-    private final DataSourceFactory factory;
 
     private long lastInsertId = 0;
     private long affectedRow = 0;
     private static final Logger LOGGER = LoggerFactory.getLogger(MycatUpdateExecutor.class);
 
-    public MycatUpdateExecutor(MycatDataContext context, Distribution distribution,
+    public MycatUpdateExecutor(MycatDataContext context, MycatUpdateRel mycatUpdateRel, Distribution distribution,
                                SQLStatement logicStatement,
-                               List<Object> parameters,
-                               DataSourceFactory factory) {
+                               List<Object> parameters) {
         this.context = context;
+        this.mycatUpdateRel = mycatUpdateRel;
 
         this.distribution = distribution;
         this.logicStatement = logicStatement;
         this.logicParameters = parameters;
 
-        this.factory = factory;
-        this.reallySqlSet = Collections.unmodifiableSet(buildReallySqlList(distribution,logicStatement,parameters));
-        factory.registered(reallySqlSet.stream().map(SQL::getTarget).distinct().collect(Collectors.toList()));
+        this.reallySqlSet = Collections.unmodifiableSet(buildReallySqlList(mycatUpdateRel,distribution,logicStatement,parameters));
     }
 
-    public static MycatUpdateExecutor create(MycatDataContext context, Distribution values,
+    public static MycatUpdateExecutor create(MycatDataContext context, MycatUpdateRel mycatUpdateRel,Distribution values,
                                              SQLStatement sqlStatement,
-                                             DataSourceFactory factory,
                                              List<Object> parameters) {
-        return new MycatUpdateExecutor(context, values, sqlStatement, parameters, factory);
+        return new MycatUpdateExecutor(context,mycatUpdateRel, values, sqlStatement, parameters);
+    }
+
+    public static MycatUpdateExecutor create(MycatUpdateRel mycatUpdateRel,MycatDataContext dataContext,List<Object> params) {
+        MycatUpdateExecutor updateExecutor;
+        if (mycatUpdateRel.isGlobal()) {
+            updateExecutor = new MycatGlobalUpdateExecutor(dataContext,mycatUpdateRel, mycatUpdateRel.getValues(),
+                    mycatUpdateRel.getSqlStatement(),
+                    params);
+        } else {
+            updateExecutor = MycatUpdateExecutor.create(dataContext,mycatUpdateRel, mycatUpdateRel.getValues(),
+                    mycatUpdateRel.getSqlStatement(),
+                    params
+            );
+        }
+        return updateExecutor;
     }
 
     public boolean isProxy() {
@@ -83,7 +94,7 @@ public class MycatUpdateExecutor implements Executor {
         SQL key = reallySqlSet.iterator().next();
         String parameterizedSql = key.getParameterizedSql();
         String sql = apply(parameterizedSql, logicParameters);
-        return Pair.of(key.getTarget(), sql);
+        return Pair.of(context.resolveDatasourceTargetName(key.getTarget(),true), sql);
     }
 
     private FastSqlUtils.Select getSelectPrimaryKeyStatementIfNeed(SQL sql){
@@ -104,9 +115,9 @@ public class MycatUpdateExecutor implements Executor {
         Map<String, MycatConnection> connections = new HashMap<>(3);
         Set<String> uniqueValues = new HashSet<>();
         for (SQL sql : reallySqlSet) {
-            String k = context.resolveDatasourceTargetName(sql.getTarget());
+            String k = context.resolveDatasourceTargetName(sql.getTarget(),true);
             if (uniqueValues.add(k)) {
-                if (connections.put(sql.getTarget(), transactionSession.getConnection(k)) != null) {
+                if (connections.put(sql.getTarget(), transactionSession.getJDBCConnection(k)) != null) {
                     throw new IllegalStateException("Duplicate key");
                 }
             }
@@ -181,28 +192,26 @@ public class MycatUpdateExecutor implements Executor {
         // 更新索引
         // todo 更新语句包含limit或者order by的情况处理，等实现了全局索引再考虑实现。 wangzihaogithub 2020-12-29
         TableHandler table = sql.getTable();
-        gsiService.updateByPrimaryKey(transactionSession.getTxId(),
+        gsiService.updateByPrimaryKey(transactionSession.getXid(),
                 table.getSchemaName(),
                 table.getTableName(),
                 sql.getSetColumnMap(),
                 primaryKeyList,sql.getTarget());
     }
 
-    private static Set<SQL> buildReallySqlList(Distribution distribution, SQLStatement statement, List<Object> parameters) {
+
+    public static Set<SQL> buildReallySqlList(MycatUpdateRel mycatUpdateRel, Distribution distribution, SQLStatement orginalStatement, List<Object> parameters) {
         List<Object> readOnlyParameters = Collections.unmodifiableList(parameters);
 
-        Iterable<DataNode> dataNodes = distribution.getDataNodes(readOnlyParameters);
+        Iterable<DataNode> dataNodes = distribution.getDataNodesAsSingleTableUpdate(mycatUpdateRel.getConditions(),readOnlyParameters);
         Map<SQL,SQL> sqlMap = new LinkedHashMap<>();
 
         for (DataNode dataNode : dataNodes) {
-            SQLExprTableSource tableSource = FastSqlUtils.getTableSource(statement);
+            SQLStatement currentStatement = FastSqlUtils.clone(orginalStatement);
+            SQLExprTableSource tableSource = FastSqlUtils.getTableSource(currentStatement);
             tableSource.setExpr(dataNode.getTable());
             tableSource.setSchema(dataNode.getSchema());
-            StringBuilder sqlStringBuilder = new StringBuilder();
-            List<Object> cloneParameters = new ArrayList<>();
-            MycatPreparedStatementUtil.outputToParameterized(statement, sqlStringBuilder, readOnlyParameters, cloneParameters);
-            String sqlString = sqlStringBuilder.toString();
-            SQL sql = SQL.of(sqlString,dataNode, SQLUtils.parseSingleMysqlStatement(sqlString),cloneParameters);
+            SQL sql = SQL.of(currentStatement.toString(),dataNode, FastSqlUtils.clone(currentStatement),new ArrayList<>(parameters));
             SQL exist = sqlMap.put(sql, sql);
             if(exist != null){
                 LOGGER.debug("remove exist sql = {}",exist);

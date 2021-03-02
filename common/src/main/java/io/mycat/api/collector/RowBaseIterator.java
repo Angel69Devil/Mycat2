@@ -17,7 +17,7 @@ import java.util.Map;
  * date 2019-05-22 01:17
  * a simple proxy collector as map
  **/
-public interface RowBaseIterator extends Closeable, BaseIterator {
+public interface RowBaseIterator extends Closeable, BaseIterator{
 
     MycatRowMetaData getMetaData();
 
@@ -57,6 +57,18 @@ public interface RowBaseIterator extends Closeable, BaseIterator {
 
     Object getObject(int columnIndex);
 
+    default Object[] getObjects() {
+        return getObjects(getMetaData().getColumnCount());
+    }
+
+    default Object[] getObjects(int count) {
+        Object[] objects = new Object[count];
+        for (int i = 0; i < count; i++) {
+            objects[i] = getObject(i);
+        }
+        return objects;
+    }
+
     BigDecimal getBigDecimal(int columnIndex);
 
     public default List<Map<String, Object>> getResultSetMap() {
@@ -69,12 +81,11 @@ public interface RowBaseIterator extends Closeable, BaseIterator {
         List<Map<String, Object>> resultList = new ArrayList<>();
         while (iterator.next()) {
             HashMap<String, Object> row = new HashMap<>(columnCount);
-            for (int i = 1; i <= columnCount; i++) {
+            for (int i = 0; i < columnCount; i++) {
                 row.put(metaData.getColumnName(i), iterator.getObject(i));
             }
             resultList.add(row);
         }
         return resultList;
     }
-
 }

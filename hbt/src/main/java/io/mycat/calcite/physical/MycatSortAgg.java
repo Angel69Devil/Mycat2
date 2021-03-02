@@ -101,9 +101,9 @@ public class MycatSortAgg extends EnumerableAggregateBase implements MycatRel {
         final EnumerableRel child = (EnumerableRel) getInput();
         final Result result = implementor.visitChild(this, 0, child, pref);
         Expression childExp =
-                builder.append(
+                toEnumerate(builder.append(
                         "child",
-                        result.block);
+                        result.block));
 
         final PhysType physType =
                 PhysTypeImpl.of(
@@ -221,5 +221,9 @@ public class MycatSortAgg extends EnumerableAggregateBase implements MycatRel {
                         )));
 
         return implementor.result(physType, builder.toBlock());
+    }
+    @Override
+    public boolean isSupportStream() {
+        return true;
     }
 }

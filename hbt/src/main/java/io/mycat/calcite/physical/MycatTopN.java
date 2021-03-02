@@ -90,7 +90,7 @@ public class MycatTopN extends Sort implements MycatRel {
                 implementor.getTypeFactory(),
                 this.getRowType(),
                 result.format);
-        final Expression childExp = builder.append("child", result.block);
+        final Expression childExp = toEnumerate(builder.append("child", result.block));
 
         final PhysType inputPhysType = result.physType;
         final Pair<Expression, Expression> pair =
@@ -134,5 +134,9 @@ public class MycatTopN extends Sort implements MycatRel {
         } else {
             return Expressions.constant(RexLiteral.intValue(rexNode));
         }
+    }
+    @Override
+    public boolean isSupportStream() {
+        return false;
     }
 }

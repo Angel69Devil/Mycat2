@@ -83,7 +83,10 @@ public class CalciteConvertors {
             int columnCount = metaData.getColumnCount();
             for (int i = 1; i <= columnCount; i++) {
                 String columnName = metaData.getColumnName(i);
-                System.out.println(columnName + ":" + metaData.getColumnTypeName(i));
+                if(LOGGER.isDebugEnabled()){
+                    LOGGER.debug(columnName + ":" + metaData.getColumnTypeName(i));
+                }
+
 
             }
 
@@ -235,7 +238,7 @@ public class CalciteConvertors {
     public static List<SimpleColumnInfo> getColumnInfo(MycatRowMetaData mycatRowMetaData) {
         int columnCount = mycatRowMetaData.getColumnCount();
         List<SimpleColumnInfo> list = new ArrayList<>();
-        for (int i = 1,id=0; i <= columnCount; i++,id++) {
+        for (int i = 0,id=0; i < columnCount; i++,id++) {
             String columnName = mycatRowMetaData.getColumnName(i);
             int columnType = mycatRowMetaData.getColumnType(i);
             int precision = mycatRowMetaData.getPrecision(i);

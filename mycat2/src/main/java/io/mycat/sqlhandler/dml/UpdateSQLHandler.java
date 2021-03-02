@@ -5,31 +5,28 @@ import com.alibaba.druid.sql.ast.SQLStatement;
 import com.alibaba.druid.sql.ast.statement.SQLExprTableSource;
 import com.alibaba.druid.sql.dialect.mysql.ast.statement.MySqlUpdateStatement;
 import io.mycat.*;
-import io.mycat.calcite.DataSourceFactory;
-import io.mycat.calcite.DefaultDatasourceFactory;
-import io.mycat.calcite.ResponseExecutorImplementor;
-import io.mycat.calcite.executor.TempResultSetFactory;
-import io.mycat.calcite.executor.TempResultSetFactoryImpl;
-import io.mycat.MetadataManager;
 import io.mycat.calcite.table.SchemaHandler;
 import io.mycat.sqlhandler.AbstractSQLHandler;
-import io.mycat.sqlhandler.DrdsRunners;
+import io.mycat.sqlhandler.HackRouter;
 import io.mycat.sqlhandler.SQLRequest;
 import io.mycat.util.NameMap;
-import io.mycat.Response;
+import io.mycat.util.Pair;
+import io.vertx.core.Future;
+import io.vertx.core.impl.future.PromiseInternal;
 import lombok.SneakyThrows;
 
-import java.util.*;
+import java.util.Objects;
+import java.util.Optional;
 
 public class UpdateSQLHandler extends AbstractSQLHandler<MySqlUpdateStatement> {
 
     @Override
-    protected void onExecute(SQLRequest<MySqlUpdateStatement> request, MycatDataContext dataContext, Response response) throws Exception {
-        updateHandler(request.getAst(), dataContext, (SQLExprTableSource) request.getAst().getTableSource(), response);
+    protected Future<Void> onExecute(SQLRequest<MySqlUpdateStatement> request, MycatDataContext dataContext, Response response) {
+        return updateHandler(request.getAst(), dataContext, (SQLExprTableSource) request.getAst().getTableSource(), response);
     }
 
     @SneakyThrows
-    public static void updateHandler(SQLStatement sqlStatement, MycatDataContext dataContext, SQLExprTableSource tableSource, Response receiver) {
+    public static Future<Void> updateHandler(SQLStatement sqlStatement, MycatDataContext dataContext, SQLExprTableSource tableSource, Response receiver) {
         String schemaName = Optional.ofNullable(tableSource.getSchema() == null ? dataContext.getDefaultSchema() : tableSource.getSchema())
                 .map(i -> SQLUtils.normalize(i)).orElse(null);
         String tableName = SQLUtils.normalize(tableSource.getTableName());
@@ -39,11 +36,9 @@ public class UpdateSQLHandler extends AbstractSQLHandler<MySqlUpdateStatement> {
         Optional<String> targetNameOptional = Optional.ofNullable(metadataManager.getPrototype());
         if (!handlerMapOptional.isPresent()) {
             if (targetNameOptional.isPresent()) {
-                receiver.proxyUpdate(targetNameOptional.get(), Objects.toString(sqlStatement));
-                return;
+                return receiver.proxyUpdate(targetNameOptional.get(), Objects.toString(sqlStatement));
             } else {
-                receiver.sendError(new MycatException("Unable to route:" + sqlStatement));
-                return;
+                return receiver.sendError(new MycatException("Unable to route:" + sqlStatement));
             }
         } else {
             NameMap< SchemaHandler> handlerMap = handlerMapOptional.get();
@@ -55,8 +50,7 @@ public class UpdateSQLHandler extends AbstractSQLHandler<MySqlUpdateStatement> {
                         return handlerMap.get(dataContext.getDefaultSchema());
                     });
             if (schemaHandler == null) {
-                receiver.sendError(new MycatException("Unable to route:" + sqlStatement));
-                return;
+                return receiver.sendError(new MycatException("Unable to route:" + sqlStatement));
             }
         }
         String defaultTargetName = schemaHandler.defaultTargetName();
@@ -64,12 +58,20 @@ public class UpdateSQLHandler extends AbstractSQLHandler<MySqlUpdateStatement> {
         TableHandler tableHandler = tableMap.get(tableName);
         ///////////////////////////////common///////////////////////////////
         if (tableHandler == null) {
-            receiver.proxyUpdate(defaultTargetName, sqlStatement.toString());
-            return;
+            return receiver.proxyUpdate(defaultTargetName, sqlStatement.toString());
         }
-        TempResultSetFactory tempResultSetFactory = new TempResultSetFactoryImpl();
-        try (DataSourceFactory datasourceFactory = new DefaultDatasourceFactory(dataContext)) {
-            DrdsRunners.runOnDrds(dataContext, sqlStatement, new ResponseExecutorImplementor(dataContext,datasourceFactory, tempResultSetFactory, receiver));
+        switch (tableHandler.getType()) {
+            case NORMAL:
+                HackRouter hackRouter = new HackRouter(sqlStatement, dataContext);
+                if(hackRouter.analyse()){
+                    Pair<String, String> plan = hackRouter.getPlan();
+                    return receiver.proxyUpdate(plan.getKey(),plan.getValue());
+                }
+                break;
+            default:
+                break;
         }
+        DrdsRunner drdsRunner = MetaClusterCurrent.wrapper(DrdsRunner.class);
+        return drdsRunner.runOnDrds(dataContext,sqlStatement,receiver);
     }
 }

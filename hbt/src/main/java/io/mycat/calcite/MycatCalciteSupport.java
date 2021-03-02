@@ -17,22 +17,16 @@ package io.mycat.calcite;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
+import io.mycat.DataNode;
 import io.mycat.MetaClusterCurrent;
 import io.mycat.api.collector.RowBaseIterator;
 import io.mycat.api.collector.RowIteratorUtil;
 import io.mycat.beans.mycat.MycatRowMetaData;
 import io.mycat.calcite.resultset.CalciteRowMetaData;
-import io.mycat.calcite.sqlfunction.datefunction.DateAddFunction;
-import io.mycat.calcite.sqlfunction.datefunction.DateSubFunction;
-import io.mycat.calcite.sqlfunction.datefunction.ExtractFunction;
-import io.mycat.calcite.sqlfunction.infofunction.*;
-import io.mycat.calcite.sqlfunction.mathfunction.CRC32Function;
 import io.mycat.calcite.sqlfunction.cmpfunction.StrictEqualFunction;
 import io.mycat.calcite.sqlfunction.datefunction.*;
-import io.mycat.calcite.sqlfunction.mathfunction.Log2Function;
-import io.mycat.calcite.sqlfunction.mathfunction.LogFunction;
-import io.mycat.calcite.sqlfunction.mathfunction.RandFunction;
-import io.mycat.calcite.sqlfunction.mathfunction.TruncateFunction;
+import io.mycat.calcite.sqlfunction.infofunction.*;
+import io.mycat.calcite.sqlfunction.mathfunction.*;
 import io.mycat.calcite.sqlfunction.stringfunction.*;
 import io.mycat.calcite.table.SingeTargetSQLTable;
 import io.mycat.hbt.ColumnInfoRowMetaData;
@@ -131,7 +125,7 @@ public enum MycatCalciteSupport implements Context {
 //            .setConformance(SqlConformanceEnum.MYSQL_5)
 //            .setCaseSensitive(false).build();
     public static final MycatTypeSystem TypeSystem = new MycatTypeSystem();
-    public static final RelDataTypeFactory TypeFactory = new MycatRelDataTypeFactory(TypeSystem);
+    public static final MycatRelDataTypeFactory TypeFactory = new MycatRelDataTypeFactory(TypeSystem);
     public static RexBuilder RexBuilder = new RexBuilder(TypeFactory);
     public static RelBuilderFactory relBuilderFactory = new RelBuilderFactory() {
         @Override
@@ -195,21 +189,40 @@ public enum MycatCalciteSupport implements Context {
                                 }
                                 return super.implicitCast(in, expected);
                             }
+
                             @Override
                             public RelDataType commonTypeForBinaryComparison(RelDataType type1, RelDataType type2) {
-                                SqlTypeName typeName1 = type1.getSqlTypeName();
-                                SqlTypeName typeName2 = type2.getSqlTypeName();
-
-                                if (typeName1 == null || typeName2 == null) {
-                                    return null;
-                                }
-                                if (typeName1 == SqlTypeName.VARBINARY && SqlTypeUtil.inCharFamily(typeName2)) {
-                                    return type2;
-                                }
-                                if (typeName2 == SqlTypeName.VARBINARY && SqlTypeUtil.inCharFamily(typeName1)) {
+                                if (type1.equals(type2)) {
                                     return type1;
                                 }
-                                return super.commonTypeForBinaryComparison(type1,type2);
+                                if (SqlTypeUtil.isCharacter(type1) && SqlTypeUtil.isCharacter(type2)) {
+                                    return typeFactory.createSqlType(SqlTypeName.VARCHAR);
+                                }
+                                if (SqlTypeUtil.isIntType(type1) && SqlTypeUtil.isIntType(type2)) {
+                                    return typeFactory.createSqlType(SqlTypeName.BIGINT);
+                                }
+                                if (SqlTypeUtil.isBinary(type1) || SqlTypeUtil.isBinary(type2)) {
+                                    return typeFactory.createSqlType(SqlTypeName.VARBINARY);
+                                }
+                                if ((SqlTypeUtil.isDatetime(type1) || SqlTypeUtil.isTimestamp(type1))
+                                        ||
+                                        (SqlTypeUtil.isDatetime(type2) || SqlTypeUtil.isTimestamp(type2))
+                                ) {
+                                    return typeFactory.createSqlType(SqlTypeName.TIMESTAMP);
+                                }
+                                if ((SqlTypeUtil.isDecimal(type1) && (SqlTypeUtil.isDecimal(type2) || SqlTypeUtil.isBigint(type2))
+                                        ||
+                                        (SqlTypeUtil.isDecimal(type2) && (SqlTypeUtil.isDecimal(type1) || SqlTypeUtil.isBigint(type1))
+                                        ))) {
+                                    return typeFactory.createSqlType(SqlTypeName.DECIMAL);
+                                }
+                                if (SqlTypeUtil.isDecimal(type1) && SqlTypeUtil.isDouble(type2)
+                                        ||
+                                        SqlTypeUtil.isDecimal(type2) && SqlTypeUtil.isDouble(type1)
+                                ) {
+                                    return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+                                }
+                                return typeFactory.createSqlType(SqlTypeName.DOUBLE);
                             }
                         };
                     }
@@ -219,10 +232,10 @@ public enum MycatCalciteSupport implements Context {
 
     static {
         Map<SqlOperator, RexImpTable.RexCallImplementor> rexImpTableMap = RexImpTable.INSTANCE.map;
-        rexImpTableMap.put(DateAddFunction.INSTANCE,DateAddFunction.INSTANCE.getRexCallImplementor());
-        rexImpTableMap.put(DateSubFunction.INSTANCE,DateSubFunction.INSTANCE.getRexCallImplementor());
-        rexImpTableMap.put(ExtractFunction.INSTANCE,ExtractFunction.INSTANCE.getRexCallImplementor());
-        rexImpTableMap.put(AddTimeFunction.INSTANCE,AddTimeFunction.INSTANCE.getRexCallImplementor());
+        rexImpTableMap.put(DateAddFunction.INSTANCE, DateAddFunction.INSTANCE.getRexCallImplementor());
+        rexImpTableMap.put(DateSubFunction.INSTANCE, DateSubFunction.INSTANCE.getRexCallImplementor());
+        rexImpTableMap.put(ExtractFunction.INSTANCE, ExtractFunction.INSTANCE.getRexCallImplementor());
+        rexImpTableMap.put(AddTimeFunction.INSTANCE, AddTimeFunction.INSTANCE.getRexCallImplementor());
 
         Frameworks.ConfigBuilder configBuilder = Frameworks.newConfigBuilder();
 //        configBuilder.parserConfig(SQL_PARSER_CONFIG);
@@ -364,6 +377,7 @@ public enum MycatCalciteSupport implements Context {
                             MycatUserValueFunction.INSTANCE,
                             MycatVersionFunction.INSTANCE,
                             MycatLastInsertIdFunction.INSTANCE,
+                            MycatRowCountFunction.INSTANCE,
                             MycatConnectionIdFunction.INSTANCE,
                             MycatCurrentUserFunction.INSTANCE,
                             MycatUserFunction.INSTANCE,
@@ -389,6 +403,11 @@ public enum MycatCalciteSupport implements Context {
                     build.put("CURRENT_DATE", CurDateFunction.INSTANCE);
                     build.put("CURTIME", CurTimeFunction.INSTANCE);
                     build.put("CURRENT_TIME", CurTimeFunction.INSTANCE);
+
+                    build.put("NOW", NowNoArgFunction.INSTANCE);
+                    build.put("CURRENT_TIMESTAMP", NowNoArgFunction.INSTANCE);
+                    build.put("LOCALTIME", NowNoArgFunction.INSTANCE);
+                    build.put("LOCALTIMESTAMP", NowNoArgFunction.INSTANCE);
 
                     build.put("NOW", NowFunction.INSTANCE);
                     build.put("CURRENT_TIMESTAMP", NowFunction.INSTANCE);
@@ -452,57 +471,10 @@ public enum MycatCalciteSupport implements Context {
     @SneakyThrows
     MycatCalciteSupport() {
         try {
-
             Class<? extends BuiltInMethod> aClass = BuiltInMethod.STRING_TO_TIMESTAMP.getClass();
-            System.out.println();
-//            Class<? extends RexImpTable> aClass = RexImpTable.class;
-//            Field mapField = aClass.getDeclaredField("map");
-//            mapField.setAccessible(true);
-//            Map<SqlOperator, RexImpTable.RexCallImplementor> o = (Map<SqlOperator, RexImpTable.RexCallImplementor>) mapField.get(RexImpTable.INSTANCE);
-//            System.out.println(o);
-//
-//            Method defineMethod = aClass.getDeclaredMethod("defineMethod", SqlOperator.class, Method.class,
-//                    NullPolicy.class);
-//            defineMethod.setAccessible(true);
-//
-//
-//            Map<SqlOperator, RexImpTable.RexCallImplementor> res = new ConcurrentHashMap<SqlOperator, RexImpTable.RexCallImplementor>() {
-//
-//                @SneakyThrows
-//                @Override
-//                public RexImpTable.RexCallImplementor get(Object key) {
-//                    RexImpTable.RexCallImplementor rexCallImplementor = super.get(key);
-//                    if (rexCallImplementor != null) {
-//                        return rexCallImplementor;
-//                    }
-//                    SqlOperator k = (SqlOperator) key;
-//                    String name = k.getName();
-//                    switch (name.toLowerCase()){
-//                        case "regexp":{
-//                            ScalarFunctionImpl implementor = (ScalarFunctionImpl)RegexpFunction.scalarFunction;
-//                            defineMethod.invoke(RexImpTable.INSTANCE, key, implementor.method, NullPolicy.ANY);
-//                          break;
-//                        }
-//                    }
-//                    return get(key);
-//                }
-//            };
-//            res.putAll(o);
-//            mapField.set(RexImpTable.INSTANCE, res);
-//
-//            Field instanceField = aClass.getDeclaredField("INSTANCE");
-//            instanceField.setAccessible(true);
-
-//            Constructor<?> declaredConstructor = aClass.getDeclaredConstructors()[0];
-//            declaredConstructor.setAccessible(true);
-
         } catch (Throwable e) {
             System.out.println(e);
         }
-
-//        }catch (Throwable e){
-//          System.err.println(e);
-//        }
     }
 
     private static void fixCalcite() {
@@ -643,11 +615,15 @@ public enum MycatCalciteSupport implements Context {
     }
 
     public SqlString convertToSql(RelNode input, SqlDialect dialect, boolean forUpdate) {
-        return convertToSql(input, dialect, forUpdate, Collections.emptyList());
+        return convertToSql(input, dialect,Collections.emptyMap(), forUpdate, Collections.emptyList());
     }
 
-    public SqlString convertToSql(RelNode input, SqlDialect dialect, boolean forUpdate, List<Object> params) {
-        MycatImplementor mycatImplementor = new MycatImplementor(dialect, params);
+    public SqlString convertToSql(RelNode input,
+                                  SqlDialect dialect,
+                                  Map<String, DataNode> map,
+                                  boolean forUpdate,
+                                  List<Object> params) {
+        MycatImplementor mycatImplementor = new MycatImplementor(dialect, params, map);
         SqlImplementor.Result implement = mycatImplementor.implement(input);
         SqlNode sqlNode = implement.asStatement();
         if (forUpdate) {
@@ -657,7 +633,7 @@ public enum MycatCalciteSupport implements Context {
                 .withAlwaysUseParentheses(true)
                 .withSelectListItemsOnSeparateLines(false)
                 .withUpdateSetListNewline(false)
-                .withQuoteAllIdentifiers(true);//mysql fun name should not wrapper quote
+                .withQuoteAllIdentifiers(false);//mysql fun name should not wrapper quote
         SqlPrettyWriter writer = new SqlPrettyWriter(config) {
             @Override
             public void dynamicParam(int index) {
@@ -716,7 +692,7 @@ public enum MycatCalciteSupport implements Context {
                 return OracleSqlDialect.DEFAULT;
             case "postgresql":
             case "polardb":
-            case  "mysql":
+            case "mysql":
             case "mariadb":
             default:
                 return MycatSqlDialect.DEFAULT;

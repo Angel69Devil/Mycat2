@@ -1,29 +1,33 @@
 package io.mycat.vertx;
 
-import io.mycat.Authenticator;
-import io.mycat.MetaClusterCurrent;
-import io.mycat.MySQLPacketUtil;
-import io.mycat.MycatUser;
-import io.mycat.beans.mysql.MySQLErrorCode;
+import cn.mycat.vertx.xa.MySQLManager;
+import cn.mycat.vertx.xa.XaLog;
+import cn.mycat.vertx.xa.impl.BaseXaSqlConnection;
+import cn.mycat.vertx.xa.impl.LocalXaSqlConnection;
+import cn.mycat.vertx.xa.impl.XaLogImpl;
+import io.mycat.*;
 import io.mycat.beans.mysql.MySQLIsolation;
+import io.mycat.beans.mysql.MySQLPayloadWriter;
 import io.mycat.beans.mysql.packet.AuthPacket;
+import io.mycat.beans.mysql.packet.AuthSwitchRequestPacket;
 import io.mycat.config.MySQLServerCapabilityFlags;
 import io.mycat.config.UserConfig;
 import io.mycat.datasource.jdbc.datasource.JdbcConnectionManager;
+import io.mycat.mycatmysql.MycatMySQLHandler;
+import io.mycat.mycatmysql.MycatMysqlSession;
 import io.mycat.proxy.handler.front.MySQLClientAuthHandler;
 import io.mycat.proxy.handler.front.SocketAddressUtil;
 import io.mycat.runtime.MycatDataContextImpl;
+import io.mycat.runtime.ProxyTransactionSession;
 import io.mycat.util.MysqlNativePasswordPluginUtil;
 import io.vertx.core.Handler;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.net.NetSocket;
 
 import java.util.Arrays;
-import java.util.Objects;
-import java.util.concurrent.atomic.AtomicInteger;
 
-import static io.mycat.vertx.VertxMySQLPacketResolver.readInt;
 import static io.mycat.beans.mysql.MySQLErrorCode.ER_ACCESS_DENIED_ERROR;
+import static io.mycat.vertx.VertxMySQLPacketResolver.readInt;
 
 public class VertxMySQLAuthHandler implements Handler<Buffer> {
     final NetSocket socket;
@@ -31,11 +35,13 @@ public class VertxMySQLAuthHandler implements Handler<Buffer> {
     private final MycatDataContextImpl mycatDataContext;
     private byte[][] seedParts;
     Buffer buffer = Buffer.buffer();
+    boolean authSwitchResponse = false;
+    private AuthPacket authPacket;
 
     public VertxMySQLAuthHandler(NetSocket socket, VertxMycatServer.MycatSessionManager mysqlProxyServerVerticle) {
         this.socket = socket;
         this.mysqlProxyServerVerticle = mysqlProxyServerVerticle;
-        this. mycatDataContext = new MycatDataContextImpl();
+        this.mycatDataContext = new MycatDataContextImpl();
         int defaultServerCapabilities = MySQLServerCapabilityFlags.getDefaultServerCapabilities();
         this.seedParts = MysqlNativePasswordPluginUtil.nextSeedBuild();
         byte[] handshakePacket = MySQLClientAuthHandler.createHandshakePayload(mycatDataContext.getSessionId(), defaultServerCapabilities, seedParts);
@@ -52,64 +58,88 @@ public class VertxMySQLAuthHandler implements Handler<Buffer> {
                 int packetId = buffer.getUnsignedByte(3);
                 Buffer payload = buffer.slice(4, buffer.length());
                 ReadView readView = new ReadView(payload);
-                AuthPacket authPacket = new AuthPacket();
-                authPacket.readPayload(readView);
-                if ("mysql_native_password".equalsIgnoreCase(authPacket.getAuthPluginName())
-                        ||
-                        authPacket.getAuthPluginName()==null) {
-                    String username = authPacket.getUsername();
-                    String host =  SocketAddressUtil.simplySocketAddress(socket.remoteAddress().toString());
-                    Authenticator authenticator = null;
-                    if (MetaClusterCurrent.exist(Authenticator.class)) {
-                        authenticator = MetaClusterCurrent.wrapper(Authenticator.class);
-                    }
-                    if (authenticator != null) {
-                        Authenticator.AuthInfo authInfo = authenticator.getPassword(username,
-                                host);
-                        String rightPassword = Objects.requireNonNull(
-                                authInfo.getRightPassword());
-                        if (!checkPassword(rightPassword, authPacket.getPassword())) {
-                            String message = "Access denied for user '" +
-                                    username +
-                                    "'@'" +
-                                    host +
-                                    "' (using password: YES)";
-                            socket.write(Buffer.buffer(MySQLPacketUtil.generateMySQLPacket(2,
-                                    MySQLPacketUtil.generateError(ER_ACCESS_DENIED_ERROR, message, 0))));
-                            socket.end();
-                            return;
-                        }
-                    }
-                    buffer = null;
-                    UserConfig userInfo = null;
-                    if (authenticator != null) {
-                        userInfo = authenticator.getUserInfo(username);
-                    }
+                if (!authSwitchResponse) {
+                    this.authPacket = new AuthPacket();
+                    authPacket.readPayload(readView);
+                    if ("mysql_native_password".equalsIgnoreCase(authPacket.getAuthPluginName())
+                            ||
+                            authPacket.getAuthPluginName() == null) {
+                        auth(packetId);
+                    } else {
+                        authSwitchResponse = true;
+                        buffer = Buffer.buffer();
 
-                    mycatDataContext.setUser(new MycatUser(username, null, null, host, userInfo));
-                    VertxSession vertxSession = new VertxSessionImpl(mycatDataContext, socket);
-                    mycatDataContext.useShcema(authPacket.getDatabase());
-                    mycatDataContext.setServerCapabilities(authPacket.getCapabilities());
-                    mycatDataContext.setAutoCommit(true);
-                    mycatDataContext.setIsolation(MySQLIsolation.READ_UNCOMMITTED);
-                    mycatDataContext.setCharsetIndex(authPacket.getCharacterSet());
-                    JdbcConnectionManager connection = MetaClusterCurrent.wrapper(JdbcConnectionManager.class);
-                    connection.getDatasourceProvider().createSession(mycatDataContext);
-                    socket.handler(new VertxMySQLPacketResolver(socket, new VertxMySQLHandler(vertxSession)));
-                    vertxSession.setPacketId(packetId);
+                        AuthSwitchRequestPacket authSwitchRequestPacket = new AuthSwitchRequestPacket();
+                        authSwitchRequestPacket.setStatus((byte) 0xfe);
+                        authSwitchRequestPacket.setAuthPluginName("mysql_native_password");
+                        authSwitchRequestPacket.setAuthPluginData(new String(seedParts[2]));
+                        MySQLPayloadWriter mySQLPayloadWriter = new MySQLPayloadWriter(1024);
+                        authSwitchRequestPacket.writePayload(mySQLPayloadWriter);
 
-                    mysqlProxyServerVerticle.addSession(vertxSession);
-
-                    vertxSession.writeOkEndPacket();
-                }else {
-                    socket.write(Buffer.buffer(MySQLPacketUtil.generateMySQLPacket(
-                            packetId+1,
-                            MySQLPacketUtil.generateError(MySQLErrorCode.ER_UNKNOWN_ERROR,"need mysql_native_password plugin",0)
-                    )));
-                    return;
+                        socket.write(Buffer.buffer(
+                                MySQLPacketUtil.generateMySQLPacket(packetId + 1, mySQLPayloadWriter)));
+                        return;
+                    }
+                } else {
+                    byte[] bytes = readView.readEOFStringBytes();
+                    authPacket.setPassword(bytes);
+                    auth(packetId);
                 }
+
             }
         }
+    }
+
+    private void auth(int packetId) {
+        String username = authPacket.getUsername();
+        String host = SocketAddressUtil.simplySocketAddress(socket.remoteAddress().toString());
+        Authenticator authenticator = null;
+        if (MetaClusterCurrent.exist(Authenticator.class)) {
+            authenticator = MetaClusterCurrent.wrapper(Authenticator.class);
+        }
+        if (authenticator != null) {
+            Authenticator.AuthInfo authInfo = authenticator.getPassword(username,
+                    host);
+            String rightPassword = (
+                    authInfo.getRightPassword());
+            if (!checkPassword(rightPassword, authPacket.getPassword())) {
+                String message = "Access denied for user '" +
+                        username +
+                        "'@'" +
+                        host +
+                        "' (using password: YES)";
+                socket.write(Buffer.buffer(MySQLPacketUtil.generateMySQLPacket(packetId+1,
+                        MySQLPacketUtil.generateError(ER_ACCESS_DENIED_ERROR, message, 0))));
+                socket.end();
+                return;
+            }
+        }
+        buffer = null;
+        UserConfig userInfo = null;
+        if (authenticator != null) {
+            userInfo = authenticator.getUserInfo(username);
+        }
+
+        mycatDataContext.setUser(new MycatUser(username, null, null, host, userInfo));
+        MycatMysqlSession vertxSession = new MycatMysqlSession(mycatDataContext, socket,
+                new LocalXaSqlConnection(()-> MetaClusterCurrent.wrapper(MySQLManager.class),MetaClusterCurrent.wrapper(XaLog.class)));
+        mycatDataContext.useShcema(authPacket.getDatabase());
+        mycatDataContext.setServerCapabilities(authPacket.getCapabilities());
+        mycatDataContext.setAutoCommit(true);
+        mycatDataContext.setIsolation(MySQLIsolation.READ_UNCOMMITTED);
+        mycatDataContext.setCharsetIndex(authPacket.getCharacterSet());
+        JdbcConnectionManager connection = MetaClusterCurrent.wrapper(JdbcConnectionManager.class);
+        TransactionSession session = connection.getDatasourceProvider().createSession(mycatDataContext);
+        XaLog xaLog = MetaClusterCurrent.wrapper(XaLog.class);
+        mycatDataContext.setTransactionSession(
+                new ProxyTransactionSession(()-> MetaClusterCurrent.wrapper(MySQLManager.class),xaLog,connection.getDatasourceProvider().createSession(mycatDataContext)));
+
+        socket.handler(new VertxMySQLPacketResolver(socket, new MycatMySQLHandler(vertxSession)));
+        vertxSession.setPacketId(packetId);
+
+        mysqlProxyServerVerticle.addSession(vertxSession);
+
+        vertxSession.writeOkEndPacket();
     }
 
     private boolean checkPassword(String rightPassword, byte[] password) {

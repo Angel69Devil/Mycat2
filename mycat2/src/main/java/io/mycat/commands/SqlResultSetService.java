@@ -5,43 +5,36 @@ import com.alibaba.druid.sql.ast.SQLStatement;
 import com.alibaba.druid.sql.ast.statement.SQLSelectStatement;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
-import com.google.common.collect.ImmutableList;
 import io.mycat.*;
+import io.mycat.api.collector.MysqlPayloadObject;
 import io.mycat.api.collector.RowBaseIterator;
-import io.mycat.beans.mycat.CopyMycatRowMetaData;
 import io.mycat.beans.mycat.MycatRowMetaData;
 import io.mycat.beans.mycat.ResultSetBuilder;
-import io.mycat.calcite.resultset.CalciteRowMetaData;
-import io.mycat.calcite.resultset.EnumeratorRowIterator;
+import io.mycat.calcite.CodeExecuterContext;
+import io.mycat.calcite.JdbcConnectionUsage;
+import io.mycat.calcite.ProxyConnectionUsage;
+import io.mycat.calcite.plan.ObservablePlanImplementorImpl;
+import io.mycat.calcite.spm.Plan;
+import io.mycat.config.ServerConfig;
 import io.mycat.config.SqlCacheConfig;
-import io.mycat.calcite.DefaultDatasourceFactory;
-import io.mycat.calcite.Executor;
-import io.mycat.calcite.ExecutorImplementorImpl;
-import io.mycat.calcite.MycatRel;
-import io.mycat.calcite.executor.TempResultSetFactoryImpl;
-import io.mycat.calcite.physical.MycatInsertRel;
-import io.mycat.calcite.physical.MycatUpdateRel;
+import io.mycat.config.ThreadPoolExecutorConfig;
 import io.mycat.runtime.MycatDataContextImpl;
-import io.mycat.sqlhandler.DrdsRunners;
+import io.mycat.runtime.ProxyTransactionSession;
 import io.mycat.util.Dumper;
 import io.mycat.util.TimeUnitUtil;
+import io.reactivex.rxjava3.core.Observable;
 import lombok.Getter;
 import lombok.SneakyThrows;
-import org.apache.calcite.linq4j.Linq4j;
-import org.apache.calcite.rel.type.RelDataType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.*;
 
-public class SqlResultSetService implements Closeable, Dumpable {
+public class  SqlResultSetService implements Closeable, Dumpable {
     final HashMap<String, SqlCacheTask> cacheConfigMap = new HashMap<>();
-    final Cache<SQLSelectStatement, Object[]> cache = CacheBuilder.newBuilder().maximumSize(65535).build();
+    final Cache<SQLSelectStatement, Optional<Observable<MysqlPayloadObject>>> cache = CacheBuilder.newBuilder().maximumSize(65535).build();
     final static Logger log = LoggerFactory.getLogger(SqlResultSetService.class);
 
     public synchronized void clear() {
@@ -128,80 +121,47 @@ public class SqlResultSetService implements Closeable, Dumpable {
         }
     }
 
-    public Optional<RowBaseIterator> get(SQLSelectStatement sqlSelectStatement) {
+    public Optional<Observable<MysqlPayloadObject>> get(SQLSelectStatement sqlSelectStatement) {
         if (cacheConfigMap.isEmpty()) {
             return Optional.empty();
         }
-        ConcurrentMap<SQLSelectStatement, Object[]> map = cache.asMap();
-        Object[] objects;
+        ConcurrentMap<SQLSelectStatement, Optional<Observable<MysqlPayloadObject>>> map = cache.asMap();
+        Optional<Observable<MysqlPayloadObject>> optionalObservable;
         if (!map.containsKey(sqlSelectStatement)) {
             return Optional.empty();
         }
-        objects = cache.getIfPresent(sqlSelectStatement);
-        if (objects == null) {
-            objects = loadResultSet(sqlSelectStatement);
-        }
-        if (objects != null &&objects.length==2&& objects[0] != null && objects[1] != null) {
-            ResultSetBuilder.DefObjectRowIteratorImpl rowIterator =
-                    new ResultSetBuilder.DefObjectRowIteratorImpl((MycatRowMetaData) objects[0], ((List<Object[]>) objects[1]).iterator());
-            return Optional.of(rowIterator);
+        optionalObservable = cache.getIfPresent(sqlSelectStatement);
+        if (optionalObservable == null) {
+         return loadResultSet(sqlSelectStatement);
         } else {
             return Optional.empty();
         }
     }
 
     @SneakyThrows
-    private Object[] loadResultSet(SQLSelectStatement sqlSelectStatement) {
-        return cache.get(sqlSelectStatement, new Callable<Object[]>() {
-            @Override
-            public Object[] call() throws Exception {
-                if (!MetaClusterCurrent.exist(DrdsRunner.class)){
-                    return new Object[2];
-                }
-                Object[] pair = new Object[2];
-                MycatDataContext context = new MycatDataContextImpl();
-                try (DefaultDatasourceFactory defaultDatasourceFactory = new DefaultDatasourceFactory(context)) {
-                    TempResultSetFactoryImpl tempResultSetFactory = new TempResultSetFactoryImpl();
-                    ExecutorImplementorImpl executorImplementor = new ExecutorImplementorImpl(context, defaultDatasourceFactory, tempResultSetFactory) {
-                        @Override
-                        public void implementRoot(MycatRel rel, List<String> aliasList) {
-                            if (rel instanceof MycatInsertRel) {
-                                return;
-                            }
-                            if (rel instanceof MycatUpdateRel) {
-                                return;
-                            }
-                            Executor executor = rel.implement(this);
-                            RelDataType rowType = rel.getRowType();
-                            EnumeratorRowIterator rowIterator = new EnumeratorRowIterator(new CalciteRowMetaData(rowType.getFieldList()),
-                                    Linq4j.asEnumerable(() -> executor.outputObjectIterator()).enumerator(), () -> {
-                            });
-                            executor.open();
-                            try {
-                                MycatRowMetaData metaData = rowIterator.getMetaData();
-                                CopyMycatRowMetaData mycatRowMetaData = new CopyMycatRowMetaData(metaData);
-                                int columnCount = metaData.getColumnCount();
-                                ImmutableList.Builder<Object[]> builder = ImmutableList.builder();
-                                while (rowIterator.next()) {
-                                    Object[] row = new Object[columnCount];
-                                    for (int i = 0; i < columnCount; i++) {
-                                        row[i] = rowIterator.getObject(i + 1);
-                                    }
-                                    builder.add(row);
-                                }
-                                ImmutableList<Object[]> objects1 = builder.build();
-                                pair[0] = mycatRowMetaData;
-                                pair[1] = objects1;
-                            } finally {
-                                executor.close();
-                            }
-                        }
-                    };
-                    DrdsRunners.runOnDrds(context, sqlSelectStatement, executorImplementor);
-                } finally {
-                    context.close();
-                }
-                return (pair);
+    private Optional<Observable<MysqlPayloadObject>> loadResultSet(SQLSelectStatement sqlSelectStatement) {
+        return cache.get(sqlSelectStatement, () -> {
+            if (!MetaClusterCurrent.exist(DrdsRunner.class)) {
+                return Optional.empty();
+            }
+            MycatDataContext context = new MycatDataContextImpl();
+            try {
+                DrdsRunner drdsRunner = MetaClusterCurrent.wrapper(DrdsRunner.class);
+                DrdsSql drdsSql = drdsRunner.preParse(sqlSelectStatement);
+                Plan plan = drdsRunner.getPlan(context, drdsSql);
+                CodeExecuterContext codeExecuterContext = plan.getCodeExecuterContext();
+                ProxyTransactionSession transactionSession = (ProxyTransactionSession) context.getTransactionSession();
+                ProxyConnectionUsage connectionUsage = JdbcConnectionUsage
+                        .computeProxyTargetConnection(context, drdsSql.getParams(), codeExecuterContext);
+                        connectionUsage.collect((ProxyTransactionSession)context.getTransactionSession(), drdsSql.getParams());
+                ObservablePlanImplementorImpl planImplementor = new ObservablePlanImplementorImpl(
+                        transactionSession,
+                        context, drdsSql.getParams(), null);
+                Observable<MysqlPayloadObject> observable = planImplementor.getMysqlPayloadObjectObservable(context, drdsSql.getParams(), plan);
+                observable= observable.cache();
+                return Optional.ofNullable(observable);
+            } finally {
+                context.close();
             }
         });
     }

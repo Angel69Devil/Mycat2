@@ -78,8 +78,8 @@ public class MycatCorrelate extends Correlate implements MycatRel {
         final Result leftResult =
                 implementor.visitChild(this, 0, (EnumerableRel) left, pref);
         Expression leftExpression =
-                builder.append(
-                        "left", leftResult.block);
+                toEnumerate(builder.append(
+                        "left", leftResult.block));
 
         final BlockBuilder corrBlock = new BlockBuilder();
         Type corrVarType = leftResult.physType.getJavaRowType();
@@ -112,7 +112,7 @@ public class MycatCorrelate extends Correlate implements MycatRel {
                 PhysTypeImpl.of(
                         implementor.getTypeFactory(),
                         getRowType(),
-                        pref.prefer(JavaRowFormat.CUSTOM));
+                        pref.prefer(JavaRowFormat.ARRAY));
 
         Expression selector =
                 EnumUtils.joinSelector(
@@ -126,5 +126,9 @@ public class MycatCorrelate extends Correlate implements MycatRel {
                         selector));
 
         return implementor.result(physType, builder.toBlock());
+    }
+    @Override
+    public boolean isSupportStream() {
+        return false;
     }
 }

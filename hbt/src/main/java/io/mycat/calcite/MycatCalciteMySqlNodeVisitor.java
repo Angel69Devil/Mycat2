@@ -13,16 +13,13 @@ import com.alibaba.druid.support.calcite.TDDLSqlSelect;
 import com.alibaba.druid.util.FnvHash;
 import com.google.common.collect.ImmutableList;
 import io.mycat.MycatException;
-import io.mycat.calcite.sqlfunction.datefunction.DateAddFunction;
-import io.mycat.calcite.sqlfunction.datefunction.DateSubFunction;
-import io.mycat.calcite.sqlfunction.datefunction.ExtractFunction;
+import io.mycat.calcite.sqlfunction.datefunction.*;
 import io.mycat.calcite.sqlfunction.infofunction.*;
 import io.mycat.calcite.sqlfunction.mathfunction.Log2Function;
 import io.mycat.calcite.sqlfunction.mathfunction.LogFunction;
 import io.mycat.calcite.sqlfunction.mathfunction.RandFunction;
 import io.mycat.calcite.sqlfunction.mathfunction.TruncateFunction;
 import io.mycat.calcite.sqlfunction.stringfunction.*;
-import io.mycat.calcite.sqlfunction.datefunction.*;
 import org.apache.calcite.avatica.util.TimeUnit;
 import org.apache.calcite.avatica.util.TimeUnitRange;
 import org.apache.calcite.sql.*;
@@ -40,6 +37,8 @@ import org.apache.calcite.util.TimestampString;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+
+import static org.apache.calcite.sql.fun.SqlStdOperatorTable.IS_NULL;
 
 public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
     static Map<Long, SqlOperator> operators = new HashMap<Long, SqlOperator>();
@@ -161,7 +160,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
 
         SqlIdentifier alias = null;
         if (x.getTableSource().getAlias() != null) {
-            alias = new SqlIdentifier(tableSource.getAlias(), SqlParserPos.ZERO);
+            alias = new SqlIdentifier(SQLUtils.normalize(tableSource.getAlias()), SqlParserPos.ZERO);
         }
 
         sqlNode = new SqlUpdate(SqlParserPos.ZERO, targetTable, targetColumnList, sourceExpressList, condition, null, alias);
@@ -179,7 +178,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
 
         SqlIdentifier alias = null;
         if (x.getTableSource().getAlias() != null) {
-            alias = new SqlIdentifier(tableSource.getAlias(), SqlParserPos.ZERO);
+            alias = new SqlIdentifier(SQLUtils.normalize(tableSource.getAlias()), SqlParserPos.ZERO);
         }
 
         sqlNode = new SqlDelete(SqlParserPos.ZERO, targetTable, condition, null, alias);
@@ -281,10 +280,20 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
         // select list
         List<SqlNode> columnNodes = new ArrayList<SqlNode>(x.getSelectList().size());
         for (SQLSelectItem selectItem : x.getSelectList()) {
-            if (selectItem.getAlias() == null && !(selectItem.getExpr() instanceof SQLAllColumnExpr)) {//fix alias
-                StringBuilder sb = new StringBuilder();
-                selectItem.output(sb);
-                selectItem.setAlias(sb.toString().replaceAll(" ", ""));
+            if (selectItem.getAlias()==null){
+                if (selectItem.getExpr() instanceof SQLAllColumnExpr){
+
+                }else if (selectItem.getExpr() instanceof SQLPropertyExpr){
+                    if(!"*".equals(((SQLPropertyExpr) selectItem.getExpr()).getName())){
+                        selectItem.setAlias(SQLUtils.normalize(((SQLPropertyExpr) selectItem.getExpr()).getName()));
+                    }
+                }else if (selectItem.getExpr() instanceof SQLIdentifierExpr){
+                    selectItem.setAlias(SQLUtils.normalize(((SQLIdentifierExpr) selectItem.getExpr()).getName()));
+                }else{
+                    StringBuilder sb = new StringBuilder();
+                    selectItem.output(sb);
+                    selectItem.setAlias(sb.toString().replaceAll(" ", ""));
+                }
             }
             SqlNode column = convertToSqlNode(selectItem);
             columnNodes.add(column);
@@ -474,7 +483,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
         }
 
         if (x.getAlias() != null) {
-            SqlIdentifier alias = new SqlIdentifier(x.computeAlias(), SqlParserPos.ZERO);
+            SqlIdentifier alias = new SqlIdentifier(SQLUtils.normalize(x.computeAlias()), SqlParserPos.ZERO);
             SqlBasicCall as = new SqlBasicCall(SqlStdOperatorTable.AS, new SqlNode[]{table, alias},
                     SqlParserPos.ZERO);
             sqlNode = as;
@@ -598,7 +607,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
 
         final String alias = x.getAlias();
         if (alias != null) {
-            SqlIdentifier aliasIdentifier = new SqlIdentifier(alias, SqlParserPos.ZERO);
+            SqlIdentifier aliasIdentifier = new SqlIdentifier(SQLUtils.normalize(alias), SqlParserPos.ZERO);
 
             List<SQLName> columns = x.getColumns();
 
@@ -626,7 +635,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
 
         final String alias = x.getAlias();
         if (alias != null) {
-            SqlIdentifier aliasIdentifier = new SqlIdentifier(alias, SqlParserPos.ZERO);
+            SqlIdentifier aliasIdentifier = new SqlIdentifier(SQLUtils.normalize(alias), SqlParserPos.ZERO);
             sqlNode = new SqlBasicCall(SqlStdOperatorTable.AS,
                     new SqlNode[]{sqlNode, aliasIdentifier},
                     SqlParserPos.ZERO);
@@ -817,7 +826,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
             }
         }
         SqlNode query = convertToSqlNode(x.getSubQuery());
-        SqlIdentifier name = new SqlIdentifier(x.getAlias(), SqlParserPos.ZERO);
+        SqlIdentifier name = new SqlIdentifier(SQLUtils.normalize(x.getAlias()), SqlParserPos.ZERO);
         sqlNode = new SqlWithItem(SqlParserPos.ZERO, name, columnList, query);
         return false;
     }
@@ -1127,7 +1136,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
                 break;
             case Is: {
                 if (rightExpr instanceof SQLNullExpr) {
-                    operator = SqlStdOperatorTable.IS_NULL;
+                    operator = IS_NULL;
                 } else if (rightExpr instanceof SQLIdentifierExpr) {
                     long hashCode64 = ((SQLIdentifierExpr) rightExpr).nameHashCode64();
                     if (hashCode64 == FnvHash.Constants.JSON
@@ -1304,7 +1313,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
             this.sqlNode = new SqlBasicCall(someOrAllOperator, new SqlNode[]{left, right},
                     SqlParserPos.ZERO);
         } else {
-            if (operator == SqlStdOperatorTable.IS_NULL
+            if (operator == IS_NULL
                     || operator == SqlStdOperatorTable.IS_NOT_NULL
                     || operator == SqlStdOperatorTable.IS_TRUE
                     || operator == SqlStdOperatorTable.IS_NOT_TRUE) {
@@ -1557,48 +1566,48 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
         }
 
         switch (methodName) {
-            case "ASCII":{
+            case "ASCII": {
                 this.sqlNode = AsciiFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "IN":{
+            case "IN": {
                 this.sqlNode = SqlStdOperatorTable.IN.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "BIT_LENGTH":{
+            case "BIT_LENGTH": {
                 this.sqlNode = BitLengthFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "BIN":{
+            case "BIN": {
                 this.sqlNode = BinFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "EXPORT_SET":{
+            case "EXPORT_SET": {
                 this.sqlNode = ExportSetFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "UNHEX":{
+            case "UNHEX": {
                 this.sqlNode = UnhexFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
             case "LCASE":
-            case "LOWER":{
+            case "LOWER": {
                 this.sqlNode = SqlStdOperatorTable.LOWER.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "SUBSTRING":{
+            case "SUBSTRING": {
                 this.sqlNode = SubStringFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "LPAD":{
+            case "LPAD": {
                 this.sqlNode = LpadFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "LTRIM":{
+            case "LTRIM": {
                 this.sqlNode = LtrimFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
-            case "MAKE_SET":{
+            case "MAKE_SET": {
                 this.sqlNode = MakeSetFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
@@ -1642,6 +1651,10 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
             }
             case "LAST_INSERT_ID": {
                 this.sqlNode = MycatLastInsertIdFunction.INSTANCE.createCall(SqlParserPos.ZERO);
+                return false;
+            }
+            case "ROW_COUNT": {
+                this.sqlNode = MycatRowCountFunction.INSTANCE.createCall(SqlParserPos.ZERO);
                 return false;
             }
             case "VERSION": {
@@ -1788,7 +1801,11 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
             case "LOCALTIME":
             case "CURRENT_TIMESTAMP":
             case "NOW": {
-                this.sqlNode = NowFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
+                if(argNodes == null||argNodes.isEmpty()){
+                    this.sqlNode = NowFunction.INSTANCE.createCall(SqlParserPos.ZERO);
+                }else {
+                    this.sqlNode = NowNoArgFunction.INSTANCE.createCall(SqlParserPos.ZERO, argNodes);
+                }
                 return false;
             }
             case "MAKEDATE": {
@@ -1919,6 +1936,11 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
                 } else {
                     functionOperator = TrimBothFunction.INSTANCE;
                 }
+                sqlNode = Objects.requireNonNull(functionOperator).createCall(SqlParserPos.ZERO, argNodes);
+                return false;
+            }
+            case "ISNULL": {
+                functionOperator = IS_NULL;
                 sqlNode = Objects.requireNonNull(functionOperator).createCall(SqlParserPos.ZERO, argNodes);
                 return false;
             }
@@ -2334,7 +2356,7 @@ public class MycatCalciteMySqlNodeVisitor extends MySqlASTVisitorAdapter {
         String alias = x.getAlias();
         if (alias != null) {
             sqlNode = new SqlBasicCall(SqlStdOperatorTable.AS
-                    , new SqlNode[]{sqlNode, new SqlIdentifier(alias, SqlParserPos.ZERO)}
+                    , new SqlNode[]{sqlNode, new SqlIdentifier(SQLUtils.normalize(alias), SqlParserPos.ZERO)}
                     , SqlParserPos.ZERO
             );
         }

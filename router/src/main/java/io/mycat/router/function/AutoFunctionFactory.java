@@ -37,7 +37,6 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.StringWriter;
-import java.math.BigInteger;
 import java.text.MessageFormat;
 import java.time.Duration;
 import java.time.LocalDate;
@@ -47,6 +46,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.function.ToIntFunction;
+import java.util.stream.Collectors;
 
 public class AutoFunctionFactory {
 
@@ -67,50 +67,54 @@ public class AutoFunctionFactory {
         int dbNum = Integer.parseInt(properties.getOrDefault("dbNum", 1).toString());
         int tableNum = Integer.parseInt(properties.getOrDefault("tableNum", 1).toString());
 
-        Integer groupNum = Optional.ofNullable(properties.get("storeNum"))
+        Integer storeNum = Optional.ofNullable(properties.get("storeNum"))
                 .map(i -> Integer.parseInt(i.toString()))
-                .orElseGet(() -> Optional.ofNullable(tableHandler.dataNodes()).filter(i -> !i.isEmpty()).map(i -> i.size())
-                        .orElseThrow(() -> new IllegalArgumentException("can not get storeNum")));
-        if (groupNum == 0){
-            throw new UnsupportedOperationException("groupNum is zero");
-        }
+                .orElseThrow(() -> new IllegalArgumentException("can not get storeNum"));
+
+        Integer storeDbNum = Optional.ofNullable(properties.get("storeDbNum"))
+                .map(i -> Integer.parseInt(i.toString())).orElse(dbNum * tableNum / storeNum);
         SQLMethodInvokeExpr tableMethod = converyToMethodExpr((String) properties.get("tableMethod"));
         SQLMethodInvokeExpr dbMethod = converyToMethodExpr((String) properties.get("dbMethod"));
         String sep = "/";
+        String erUniqueName = Optional.ofNullable(dbMethod).map(i->i.getMethodName()).orElse("")
+                +Optional.ofNullable(tableMethod).map(i->i.getMethodName()).orElse("")
+                +" storeNum:"+storeNum+" storeDbNum:"+storeDbNum+" dbNum:"+dbNum+" tableNum:"+tableNum;
         String mappingFormat = (String) properties.getOrDefault("mappingFormat",
                 String.join(sep, "c${targetIndex}",
                         tableHandler.getSchemaName() + "_${dbIndex}",
                         tableHandler.getTableName() + "_${tableIndex}"));
-        List<IndexDataNode> datanodes = new ArrayList<>();
+        Map<Integer, List<IndexDataNode>> datanodes = new HashMap<>();
         List<int[]> seq = new ArrayList<>();
-        {
-            int tableIndex = 0;
-            for (int dbIndex = 0; dbIndex < dbNum; dbIndex++) {
-                for (int i = 0; i < tableNum;i++, tableIndex++) {
-                    seq.add(new int[]{dbIndex, tableIndex});
-                }
+        int tableCount = 0;
+        for (int dbIndex = 0; dbIndex < dbNum; dbIndex++) {
+            for ( int tableIndex = 0; tableIndex < tableNum; tableCount++,tableIndex++) {
+                seq.add(new int[]{dbIndex, tableCount,tableIndex});
             }
         }
+
         SimpleTemplateEngine templateEngine = new SimpleTemplateEngine();
         Template template = templateEngine.createTemplate(mappingFormat);
         HashMap<String, Object> context = new HashMap<>(properties);
 
+
         Map<Key, DataNode> cache = new ConcurrentHashMap<>();
         for (int i = 0; i < seq.size(); i++) {
-            int seqIndex = i % groupNum;
+            int seqIndex = i / storeDbNum;
             int[] ints = seq.get(i);
-            int dbIndex = ints[0];
-            int tableIndex = ints[1];
+            int currentDbIndex = ints[0];
+            int currentTableCount= ints[1];
+            int currentTableIndex = ints[2];
             context.put("targetIndex", String.valueOf(seqIndex));
-            context.put("dbIndex", String.valueOf(dbIndex));
-            context.put("tableIndex", String.valueOf(tableIndex));
+            context.put("dbIndex", String.valueOf(currentDbIndex));
+            context.put("tableIndex", String.valueOf(currentTableIndex));
             StringWriter stringWriter = new StringWriter();
             template.make(context).writeTo(stringWriter);
             String[] strings = SplitUtil.split(stringWriter.getBuffer().toString(), sep);
 
-            IndexDataNode backendTableInfo = new IndexDataNode(strings[0], strings[1], strings[2], dbIndex, tableIndex);
+            IndexDataNode backendTableInfo = new IndexDataNode(strings[0], strings[1], strings[2], currentDbIndex, currentTableCount);
             cache.put(new Key(ints[0], ints[1]), backendTableInfo);
-            datanodes.add(backendTableInfo);
+            List<IndexDataNode> nodeList = datanodes.computeIfAbsent(currentDbIndex, (k) -> new ArrayList<>());
+            nodeList.add(backendTableInfo);
         }
 
 
@@ -369,7 +373,7 @@ public class AutoFunctionFactory {
                     tableShardingKeys.add(tableShardingKey);
                     dbShardingKeys.add(dbShardingKey);
 
-                    dbFunction = specilizeSingleModHash(dbNum, dbColumn);
+
 
                     if (tableShardingKey.equalsIgnoreCase(dbShardingKey)) {
                         int total = dbNum * tableNum;
@@ -389,7 +393,10 @@ public class AutoFunctionFactory {
                             }
                             throw new UnsupportedOperationException();
                         };
-                        dbShardingKeys.clear();
+                        ToIntFunction<Object> function = tableFunction;
+                        dbFunction = (o) -> {
+                          return   function.applyAsInt(o)/tableNum;
+                        };
                     } else {
                         tableFunction = specilizeSingleModHash(tableNum, tableColumn);
                     }
@@ -447,9 +454,9 @@ public class AutoFunctionFactory {
                 Set<Map.Entry<String, Collection<RangeVariable>>> entries = stringCollectionMap.entrySet();
                 for (Map.Entry<String, Collection<RangeVariable>> e : entries) {
                     for (String dbShardingKey : dbShardingKeys) {
-                        if(SQLUtils.nameEquals(dbShardingKey,e.getKey())){
+                        if (SQLUtils.nameEquals(dbShardingKey, e.getKey())) {
                             Collection<RangeVariable> rangeVariables = e.getValue();
-                            if (rangeVariables.size()!=1){
+                            if (rangeVariables.size() != 1) {
                                 break;
                             }
                             if (rangeVariables != null && !rangeVariables.isEmpty()) {
@@ -473,9 +480,9 @@ public class AutoFunctionFactory {
                         }
                     }
                     for (String tableShardingKey : tableShardingKeys) {
-                        if(SQLUtils.nameEquals(tableShardingKey,e.getKey())){
+                        if (SQLUtils.nameEquals(tableShardingKey, e.getKey())) {
                             Collection<RangeVariable> rangeVariables = e.getValue();
-                            if (rangeVariables.size()!=1){
+                            if (rangeVariables.size() != 1) {
                                 break;
                             }
                             if (rangeVariables != null && !rangeVariables.isEmpty()) {
@@ -496,104 +503,31 @@ public class AutoFunctionFactory {
                     }
                 }
                 if (getDbIndex && getTIndex) {
-                    for (IndexDataNode datanode : datanodes) {
-                        if (dIndex == datanode.getDbIndex()&&tIndex == datanode.getTableIndex()) {
-                            return Collections.singletonList(datanode);
+                    List<IndexDataNode> indexDataNodes = Objects.requireNonNull((List) datanodes.get(dIndex));
+                    for (IndexDataNode indexDataNode : indexDataNodes) {
+                        if(indexDataNode.getTableIndex() ==  tIndex){
+                            return Collections.singletonList(indexDataNode);
                         }
                     }
-                    return (List) datanodes;
                 }
                 if (getDbIndex) {
-                    List<DataNode> list = new ArrayList<>();
-                    for (IndexDataNode i : datanodes) {
-                        if (i.getDbIndex() == dIndex) {
-                            list.add(i);
-                        }
-                    }
-                    return list;
+                    return new ArrayList<>((List) datanodes.get(dIndex));
                 }
                 if (getTIndex) {
-                    List<DataNode> list = new ArrayList<>();
-                    for (IndexDataNode i : datanodes) {
-                        if (i.getTableIndex() == tIndex) {
-                            list.add(i);
-                        }
-                    }
-                    return list;
-                }
-                return Collections.unmodifiableList(datanodes);
-            }
-        };
-        Set<String> keys = new HashSet<>(dbShardingKeys);
-        keys.addAll(tableShardingKeys);
-
-        return new CustomRuleFunction() {
-            @Override
-            public String name() {
-                return MessageFormat.format("dbNum:{0} tableNum:{1} dbMethod:{2} tableMethod:{3}",
-                        dbNum, tableNum, dbMethod, tableMethod);
-            }
-
-            @Override
-            public List<DataNode> calculate(Map<String, Collection<RangeVariable>> values) {
-                return Objects.requireNonNull(function.apply(values));
-            }
-
-            @Override
-            protected void init(ShardingTableHandler tableHandler, Map<String, Object> properties, Map<String, Object> ranges) {
-
-            }
-
-            @Override
-            public boolean isShardingKey(String name) {
-                return keys.contains(SQLUtils.normalize(name));
-            }
-        };
-    }
-
-    @NotNull
-    private static CustomRuleFunction createDoubleFunction(List<IndexDataNode> datanodes, String dbShardingKey, Set<String> shardingKeys, ToIntFunction<Object> function) {
-        return new CustomRuleFunction() {
-            @Override
-            public String name() {
-                return null;
-            }
-
-            @Override
-            public List<DataNode> calculate(Map<String, Collection<RangeVariable>> values) {
-                for (Map.Entry<String, Collection<RangeVariable>> e : values.entrySet()) {
-                    if(SQLUtils.nameEquals(e.getKey(),dbShardingKey)){
-                        Collection<RangeVariable> rangeVariables = e.getValue();
-                        if (rangeVariables != null && !rangeVariables.isEmpty()) {
-                            for (RangeVariable rangeVariable : rangeVariables) {
-                                switch (rangeVariable.getOperator()) {
-                                    case EQUAL:
-                                        Object value = rangeVariable.getValue();
-                                        int i = function.applyAsInt(value);
-                                        return Collections.singletonList(datanodes.get(i));
-                                }
+                    for (List<IndexDataNode> value : datanodes.values()) {
+                        for (IndexDataNode indexDataNode : value) {
+                            if(indexDataNode.getTableIndex() ==  tIndex){
+                                return Collections.singletonList(indexDataNode);
                             }
                         }
                     }
                 }
-                return (List) datanodes;
-            }
-
-            @Override
-            protected void init(ShardingTableHandler tableHandler, Map<String, Object> properties, Map<String, Object> ranges) {
-
-            }
-
-            @Override
-            public boolean isShardingKey(String name) {
-                for (String shardingKey : shardingKeys) {
-                    if (shardingKey.equalsIgnoreCase(name)) {
-                        return true;
-                    }
-                }
-                return false;
+                return datanodes.values().stream().flatMap(i -> i.stream()).collect(Collectors.toList());
             }
         };
+
+
+        return new AutoFunction(dbNum, tableNum, dbMethod, tableMethod,dbShardingKeys,tableShardingKeys,function,erUniqueName);
     }
 
     @NotNull
@@ -734,6 +668,34 @@ public class AutoFunctionFactory {
                 throw new IllegalStateException("Unexpected value: " + column1.getType());
         }
         return tableFunction;
+    }
+
+    @NotNull
+    public static ToIntFunction<Object> specilizeSingleDivHash(int num, SimpleColumnInfo columnInfo) {
+        ToIntFunction<Object> dbFunction;
+        switch (columnInfo.getType()) {
+            case NUMBER:
+                dbFunction = o -> singleDivHash(num, (Number) columnInfo.normalizeValue(o));
+                break;
+            case STRING:
+                dbFunction = o -> singleDivHash(num, (String) columnInfo.normalizeValue(o));
+                break;
+            case BLOB:
+                dbFunction = o -> singleDivHash(num, (byte[]) columnInfo.normalizeValue(o));
+                break;
+            case TIME:
+                dbFunction = o -> singleDivHash(num, (Duration) columnInfo.normalizeValue(o));
+                break;
+            case DATE:
+                dbFunction = o -> singleDivHash(num, (LocalDate) columnInfo.normalizeValue(o));
+                break;
+            case TIMESTAMP:
+                dbFunction = o -> singleDivHash(num, (LocalDateTime) columnInfo.normalizeValue(o));
+                break;
+            default:
+                throw new IllegalStateException("Unexpected value: " + columnInfo.getType());
+        }
+        return dbFunction;
     }
 
     @NotNull
@@ -940,17 +902,17 @@ public class AutoFunctionFactory {
 
     public static int mm(int num, Object o) {
         if (o == null) return 0;
-        long mm ;
+        long mm;
         if (o instanceof String) {
             o = LocalDate.parse((String) o);
         }
         if (o instanceof LocalDate) {
             LocalDate localDate = (LocalDate) o;
             mm = localDate.getMonthValue();
-        }else if (o instanceof LocalDateTime) {
+        } else if (o instanceof LocalDateTime) {
             LocalDateTime localDateTime = (LocalDateTime) o;
             mm = localDateTime.getMonthValue();
-        }else {
+        } else {
             throw new UnsupportedOperationException();
         }
         return (int) (mm % num);
@@ -958,20 +920,20 @@ public class AutoFunctionFactory {
 
     public static int dd(int num, Object o) {
         if (o == null) return 0;
-        long day ;
+        long day;
         if (o instanceof String) {
             o = LocalDate.parse((String) o);
         }
         if (o instanceof LocalDate) {
             LocalDate localDate = (LocalDate) o;
             day = localDate.getDayOfMonth();
-        }else if (o instanceof LocalDateTime) {
+        } else if (o instanceof LocalDateTime) {
             LocalDateTime localDateTime = (LocalDateTime) o;
             day = localDateTime.getDayOfMonth();
-        }else {
+        } else {
             throw new UnsupportedOperationException();
         }
-        return (int) (day% num);
+        return (int) (day % num);
     }
 
     public static int mmdd(int num, Object o) {
@@ -983,13 +945,13 @@ public class AutoFunctionFactory {
         if (o instanceof LocalDate) {
             LocalDate localDate = (LocalDate) o;
             day = localDate.getDayOfYear();
-        }else if (o instanceof LocalDateTime) {
+        } else if (o instanceof LocalDateTime) {
             LocalDateTime localDateTime = (LocalDateTime) o;
             day = localDateTime.getDayOfYear();
-        }else {
+        } else {
             throw new UnsupportedOperationException();
         }
-        return (int)((day) % num);
+        return (int) ((day) % num);
     }
 
     public static int strHash(int num, int startIndex, int endIndex, int valType, int randSeed, Object value) {
@@ -999,7 +961,7 @@ public class AutoFunctionFactory {
             return hashCode(s, randSeed) % num;
         }
         if (valType == 1) {
-            return (int)(Long.parseLong(s) % num);
+            return (int) (Long.parseLong(s) % num);
         }
         throw new UnsupportedOperationException();
     }
@@ -1149,6 +1111,27 @@ public class AutoFunctionFactory {
         return (int) (o.longValue() % num);
     }
 
+    public static int singleDivHash(int num, Number o) {
+        if (o == null) {
+            o = 0;
+        }
+        return (int) (o.longValue() / num);
+    }
+    public static int singleDivHash(int num, String o) {
+        if (o == null) {
+            o = "null";
+        }
+        return (int) (hashCode(o) / num);
+    }
+    public static int singleDivHash(int num, Object o) {
+        if (o instanceof Number) {
+            return singleDivHash(num, (Number) o);
+        }
+        if (o instanceof String) {
+            return singleDivHash(num, (String) o);
+        }
+        throw new UnsupportedOperationException();
+    }
 //    public static int singleRemainderHash(int num, Object o) {
 //        if (o instanceof Number) {
 //            return singleRemainderHash(num, (Number) o);
